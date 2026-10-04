@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Compiles the loose-source plugin folder (../../tomyum-votes, the one mounted into the server)
+    against TomYum.Plugins.Abstractions, plus the tests. Kept outside the plugin folder so the
+    server's loader never compiles the tests.
+  -->
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- CA1861: constant arrays in assertions are fine in tests. -->
+    <NoWarn>$(NoWarn);CA1861</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../../tomyum-votes/**/*.cs" Link="Plugin/%(RecursiveDir)%(Filename)%(Extension)" />
+    <None Include="../../tomyum-votes/plugin.json" Link="Plugin/plugin.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../../TomYum/src/TomYum.Plugins.Abstractions/TomYum.Plugins.Abstractions.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Configuration binding the host uses (env vars, YAML-like keys), to check the real setting names. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <!-- The loader's Roslyn, to compile the folder exactly as the server does. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.14.0" />
+    <!-- Only for the opt-in MySQL tests (TOMYUM_VOTES_TEST_MYSQL). -->
+    <PackageReference Include="MySqlConnector" Version="2.4.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+</Project>

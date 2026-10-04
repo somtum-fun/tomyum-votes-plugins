@@ -1,0 +1,8 @@
+{
+  "id": "tomyum.votes",
+  "name": "Votes (osu-server-list.com)",
+  "version": "1.0.0",
+  "authors": "Phapoom Saksri",
+  "description": "Votes from osu-server-list.com: GET /vote-callback counts the vote and gives osu!supporter days, !vote shows your votes and the link, and supporter that has run out is taken off.",
+  "entryPoint": "VotesPlugin"
+}
