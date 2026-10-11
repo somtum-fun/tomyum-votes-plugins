@@ -1,8 +1,8 @@
 {
   "id": "tomyum.votes",
   "name": "Votes (osu-server-list.com)",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "authors": "Phapoom Saksri",
-  "description": "Votes from osu-server-list.com: GET /vote-callback counts the vote and gives osu!supporter days, !vote shows your votes and the link, and supporter that has run out is taken off.",
+  "description": "Votes from osu-server-list.com: GET /vote-callback counts the vote and gives osu!direct days (in game at login, and the website's osu!direct button), !vote shows your votes and the link, and bought supporter that has run out is taken off.",
   "entryPoint": "VotesPlugin"
 }

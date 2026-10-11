@@ -1,11 +1,13 @@
 // Votes plugin (tomyum.votes): votes from osu-server-list.com (OSL), like bancho.py's voteCallback.
 //
 //   - GET /vote-callback?username=&key= : OSL calls it when someone votes. 401 for a wrong key, 404
-//     for an unknown player, 200 when counted. Each vote adds daysPerVote days of osu!supporter on top
-//     of any time left, and BanchoBot thanks the player when they're online.
-//   - !vote : the player's votes, their supporter end date and the voting link.
-//   - Every few minutes, supporter whose end date has passed is taken off (bought or voted: nothing
-//     else in the stack does it), and players online get a notification.
+//     for an unknown player, 200 when counted. Each vote adds daysPerVote days of osu!direct on top of
+//     any time left (not supporter: no other supporter perks), and BanchoBot thanks the player online.
+//   - At login (TomYum's ClientPerksEvent), a voter with osu!direct time left gets osu!direct in game;
+//     the website shows them its osu!direct button from the same table.
+//   - !vote : the player's votes, their osu!direct (or supporter) end date and the voting link.
+//   - Every few minutes, bought supporter whose end date has passed is taken off (nothing else in the
+//     stack does it), and players online get a notification.
 //
 // Needs trusted database access (Plugins:Trusted). Human docs: README.md at the repo root.
 
@@ -67,9 +69,9 @@ public sealed class VotesPlugin : IPlugin
     public PluginManifest Manifest { get; } = new(
         Id: "tomyum.votes",
         Name: "Votes (osu-server-list.com)",
-        Version: "1.0.0",
+        Version: "1.1.0",
         Authors: "Phapoom Saksri",
-        Description: "osu-server-list.com votes: GET /vote-callback, !vote, and osu!supporter days for voting.");
+        Description: "osu-server-list.com votes: GET /vote-callback, !vote, and osu!direct days for voting.");
 
     /// <summary>The host-name labels the callback was mapped on (empty: every host).</summary>
     public IReadOnlyList<string> Subdomains { get; private set; } = Array.Empty<string>();
@@ -108,8 +110,11 @@ public sealed class VotesPlugin : IPlugin
 
         _registrations.Add(context.Commands.Register(
             "vote",
-            "vote for the server and get osu!supporter",
+            "vote for the server and get osu!direct",
             HandleCommandAsync));
+
+        if (_store is not null)
+            _registrations.Add(context.Events.Subscribe<ClientPerksEvent>(HandleClientPerksAsync));
 
         if (_apiKey.Length == 0)
             _logger.Warn("tomyum.votes: apiKey isn't set, so every vote callback is refused. Set Plugins:tomyum.votes:apiKey to OSL's key.");
@@ -124,7 +129,7 @@ public sealed class VotesPlugin : IPlugin
 
         var hosts = Subdomains.Count == 0 ? "every host" : string.Join(", ", Subdomains.Select(s => s + ".<domain>"));
         _logger.Info(
-            $"tomyum.votes: GET {CallbackPath} on {hosts}; {VoteText.Days(_daysPerVote)} of supporter per vote; "
+            $"tomyum.votes: GET {CallbackPath} on {hosts}; {VoteText.Days(_daysPerVote)} of osu!direct per vote; "
             + (expireSupporter && _store is not null ? $"ended supporter is taken off every {_expireInterval.TotalMinutes} min." : "supporter isn't expired by this plugin."));
         return Task.CompletedTask;
     }
@@ -235,8 +240,8 @@ public sealed class VotesPlugin : IPlugin
 
             var result = await _store.RecordVoteAsync(user.UserId, _daysPerVote, cancellationToken).ConfigureAwait(false);
             _logger?.Info(
-                $"tomyum.votes: vote from {user.Username} ({user.UserId}), {result.Votes} in total; supporter: {result.Supporter}"
-                + (result.SupporterEndsUtc is { } end ? $" until {end:yyyy-MM-dd HH:mm} UTC." : "."));
+                $"tomyum.votes: vote from {user.Username} ({user.UserId}), {result.Votes} in total"
+                + (result.DirectEndsUtc is { } end ? $"; osu!direct until {end:yyyy-MM-dd HH:mm} UTC." : "."));
 
             if (_messenger is not null)
             {
@@ -251,6 +256,24 @@ public sealed class VotesPlugin : IPlugin
         {
             _logger?.Error($"tomyum.votes: counting a vote for '{Shorten(username)}' failed.", ex);
             return Text(500, "Something went wrong.");
+        }
+    }
+
+    /// <summary>At login: a voter with osu!direct time left gets osu!direct in game for the session.</summary>
+    private async Task HandleClientPerksAsync(ClientPerksEvent perks, CancellationToken cancellationToken)
+    {
+        if (_store is null)
+            return;
+
+        try
+        {
+            if (await _store.HasDirectAsync(perks.UserId, cancellationToken).ConfigureAwait(false))
+                perks.OsuDirect = true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Never in the way of a login: they just don't get osu!direct this time.
+            _logger?.Warn($"tomyum.votes: reading osu!direct of user {perks.UserId} failed: {ex.Message}");
         }
     }
 

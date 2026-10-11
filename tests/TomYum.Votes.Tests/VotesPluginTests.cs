@@ -108,7 +108,7 @@ public sealed class VotesPluginTests
     }
 
     [Fact]
-    public async Task A_vote_counts_gives_a_day_and_banchobot_says_thanks()
+    public async Task A_vote_counts_gives_a_day_of_osu_direct_and_banchobot_says_thanks()
     {
         var (plugin, context, store, messenger) = await StartAsync();
         store.Add(5, "blueskychan_");
@@ -118,22 +118,24 @@ public sealed class VotesPluginTests
 
         Assert.Equal(200, response.StatusCode);
         Assert.Equal(1, store.Votes[5]);
-        Assert.True(store.Accounts[5].Subscriber);
-        Assert.Equal(store.NowUtc.AddDays(1), store.Accounts[5].Expiry);
+        Assert.Equal(store.NowUtc.AddDays(1), store.Direct[5]);
+        // osu!direct only: no supporter.
+        Assert.False(store.Accounts[5].Subscriber);
+        Assert.Null(store.Accounts[5].Expiry);
         Assert.Collection(
             messenger.BotMessages,
-            m => Assert.Equal((5L, "Thank you for voting for osu!somtum! That was your first vote."), m),
+            m => Assert.Equal((5L, "Thank you for voting for somtum.fun! That was your first vote."), m),
             m =>
             {
                 Assert.Equal(5, m.UserId);
-                Assert.StartsWith("You got 1 day of osu!supporter! It now lasts until 5 October 2026, 12:00 UTC.", m.Text, StringComparison.Ordinal);
+                Assert.StartsWith("You got 1 day of osu!direct! It now lasts until 5 October 2026, 12:00 UTC.", m.Text, StringComparison.Ordinal);
             });
-        Assert.Contains(context.Log.Infos, i => i.Contains("vote from blueskychan_ (5), 1 in total", StringComparison.Ordinal));
+        Assert.Contains(context.Log.Infos, i => i.Contains("vote from blueskychan_ (5), 1 in total; osu!direct until", StringComparison.Ordinal));
         await plugin.ShutdownAsync();
     }
 
     [Fact]
-    public async Task Votes_stack_on_bought_supporter_and_days_per_vote_is_used()
+    public async Task Votes_stack_and_days_per_vote_is_used_and_supporter_is_left_alone()
     {
         var (plugin, context, store, messenger) = await StartAsync(("daysPerVote", "3"));
         var bought = store.NowUtc.AddDays(30);
@@ -144,24 +146,41 @@ public sealed class VotesPluginTests
         Assert.Equal(200, (await CallAsync(context, "lilily", Key)).StatusCode);
 
         Assert.Equal(2, store.Votes[9]);
-        Assert.Equal(bought.AddDays(6), store.Accounts[9].Expiry);
-        Assert.Contains(messenger.BotMessages, m => m.Text == "Thank you for voting for osu!somtum! You've voted twice now.");
-        Assert.Contains(messenger.BotMessages, m => m.Text.StartsWith("You got 3 days of osu!supporter!", StringComparison.Ordinal));
+        Assert.Equal(store.NowUtc.AddDays(6), store.Direct[9]);
+        Assert.Equal(bought, store.Accounts[9].Expiry);
+        Assert.Contains(messenger.BotMessages, m => m.Text == "Thank you for voting for somtum.fun! You've voted twice now.");
+        Assert.Contains(messenger.BotMessages, m => m.Text.StartsWith("You got 3 days of osu!direct!", StringComparison.Ordinal));
         await plugin.ShutdownAsync();
     }
 
-    [Fact]
-    public async Task Supporter_with_no_end_date_is_left_alone()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Login_unlocks_osu_direct_while_voted_time_is_left(bool timeLeft)
     {
-        var (plugin, context, store, messenger) = await StartAsync();
-        store.Add(2, "peppy", subscriber: true, expiry: null);
-        messenger.Online.Add(2);
+        var (plugin, context, store, _) = await StartAsync();
+        store.Add(5, "blueskychan_");
+        store.Direct[5] = timeLeft ? store.NowUtc.AddHours(1) : store.NowUtc.AddMinutes(-1);
 
-        Assert.Equal(200, (await CallAsync(context, "peppy", Key)).StatusCode);
+        var perks = new ClientPerksEvent(5);
+        await context.EventBus.PublishAsync(perks);
 
-        Assert.Null(store.Accounts[2].Expiry);
-        Assert.Equal(1, store.Votes[2]);
-        Assert.Contains(messenger.BotMessages, m => m.Text.Contains("no end date", StringComparison.Ordinal));
+        Assert.Equal(timeLeft, perks.OsuDirect);
+        await plugin.ShutdownAsync();
+        Assert.Equal(0, context.EventBus.Subscriptions);
+    }
+
+    [Fact]
+    public async Task A_database_error_at_login_gives_no_osu_direct_but_no_error()
+    {
+        var (plugin, context, store, _) = await StartAsync();
+        store.Throw = new InvalidOperationException("db down");
+
+        var perks = new ClientPerksEvent(5);
+        await context.EventBus.PublishAsync(perks);
+
+        Assert.False(perks.OsuDirect);
+        Assert.Contains(context.Log.Warnings, w => w.Contains("reading osu!direct", StringComparison.Ordinal));
         await plugin.ShutdownAsync();
     }
 
@@ -174,7 +193,7 @@ public sealed class VotesPluginTests
 
         Assert.Equal(200, (await CallAsync(context, "blueskychan_", Key)).StatusCode);
 
-        Assert.False(store.Accounts[5].Subscriber);
+        Assert.False(store.Direct.ContainsKey(5));
         Assert.Single(messenger.BotMessages);
         await plugin.ShutdownAsync();
     }
@@ -246,7 +265,7 @@ public sealed class VotesPluginTests
         Assert.Equal(
             "You've voted 7 times. Thank you!\n"
             + "Your osu!supporter lasts until 6 October 2026, 12:00 UTC.\n"
-            + "Every vote gives you 1 day of osu!supporter, added on top of any you already have.\n"
+            + "Every vote gives you 1 day of osu!direct, added on top of any you already have.\n"
             + "[https://example.com/vote Click here to vote!]",
             reply);
         await plugin.ShutdownAsync();

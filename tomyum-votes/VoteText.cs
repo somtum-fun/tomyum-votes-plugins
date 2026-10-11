@@ -12,33 +12,26 @@ public static class VoteText
     /// <param name="votes">The player's votes, this one included.</param>
     /// <returns>The message.</returns>
     public static string ThankYou(int votes) => votes <= 1
-        ? "Thank you for voting for osu!somtum! That was your first vote."
-        : Invariant($"Thank you for voting for osu!somtum! You've voted {Times(votes)} now.");
+        ? "Thank you for voting for somtum.fun! That was your first vote."
+        : Invariant($"Thank you for voting for somtum.fun! You've voted {Times(votes)} now.");
 
     /// <summary>Second BanchoBot message after a vote: what it gave them, or null when it gave nothing.</summary>
     /// <param name="result">What the vote did.</param>
-    /// <param name="daysPerVote">Days of supporter per vote.</param>
+    /// <param name="daysPerVote">Days of osu!direct per vote.</param>
     /// <returns>The message, or null.</returns>
     public static string? Reward(VoteResult result, int daysPerVote)
     {
         ArgumentNullException.ThrowIfNull(result);
-        return result.Supporter switch
-        {
-            SupporterChange.Extended when result.SupporterEndsUtc is { } end =>
-                Invariant($"You got {Days(daysPerVote)} of osu!supporter! It now lasts until {Date(end)}. ")
-                + "If you're in game, log out and back in to get it there too.",
-            SupporterChange.Extended =>
-                Invariant($"You got {Days(daysPerVote)} of osu!supporter!"),
-            SupporterChange.NoEndDate =>
-                "Your osu!supporter has no end date, so there are no days to add. Thanks anyway!",
-            _ => null,
-        };
+        return result.DirectEndsUtc is { } end
+            ? Invariant($"You got {Days(daysPerVote)} of osu!direct! It now lasts until {Date(end)}. ")
+              + "If you're in game, log out and back in to get it there too."
+            : null;
     }
 
     /// <summary>The reply to <c>!vote</c>.</summary>
-    /// <param name="status">The player's votes and supporter, or null when they can't be read.</param>
+    /// <param name="status">The player's votes, osu!direct and supporter, or null when they can't be read.</param>
     /// <param name="voteUrl">Where to vote.</param>
-    /// <param name="daysPerVote">Days of supporter per vote (0: votes don't give supporter).</param>
+    /// <param name="daysPerVote">Days of osu!direct per vote (0: votes don't give any).</param>
     /// <returns>The reply.</returns>
     public static string Command(VoteStatus? status, string voteUrl, int daysPerVote)
     {
@@ -54,18 +47,22 @@ public static class VoteText
                     ? Invariant($"Your osu!supporter lasts until {Date(end)}.")
                     : "Your osu!supporter has no end date.");
             }
+            else if (status.DirectEndsUtc is { } direct)
+            {
+                lines.Add(Invariant($"Your osu!direct lasts until {Date(direct)}."));
+            }
         }
 
         lines.Add(daysPerVote > 0
-            ? Invariant($"Every vote gives you {Days(daysPerVote)} of osu!supporter, added on top of any you already have.")
-            : "Voting helps more players find osu!somtum.");
+            ? Invariant($"Every vote gives you {Days(daysPerVote)} of osu!direct, added on top of any you already have.")
+            : "Voting helps more players find somtum.fun.");
         lines.Add(Invariant($"[{voteUrl} Click here to vote!]"));
         return string.Join("\n", lines);
     }
 
     /// <summary>The notification when a player's supporter runs out while they're online.</summary>
     public static string SupporterEnded =>
-        "Your osu!supporter has ended. Thanks for supporting osu!somtum! Type !vote to see how to get more days for free.";
+        "Your osu!supporter has ended. Thanks for supporting somtum.fun! Type !vote to see how to get osu!direct for free.";
 
     /// <summary>"1 day", "3 days".</summary>
     /// <param name="days">The number of days.</param>

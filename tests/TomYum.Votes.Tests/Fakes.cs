@@ -45,22 +45,28 @@ internal sealed class FakeStore : IVoteStore
         return Task.FromResult<VoteUser?>(null);
     }
 
-    public Task<VoteResult> RecordVoteAsync(long userId, int supporterDays, CancellationToken cancellationToken)
+    public Dictionary<long, DateTime> Direct { get; } = new();
+
+    public Task<VoteResult> RecordVoteAsync(long userId, int directDays, CancellationToken cancellationToken)
     {
         Calls++;
         ThrowIfSet();
-        var account = Accounts[userId];
+        _ = Accounts[userId];
         Votes[userId] = Votes.GetValueOrDefault(userId) + 1;
         var votes = Votes[userId];
-        if (supporterDays <= 0)
-            return Task.FromResult(new VoteResult(votes, SupporterChange.None, null));
-        if (account.Subscriber && account.Expiry is null)
-            return Task.FromResult(new VoteResult(votes, SupporterChange.NoEndDate, null));
+        if (directDays <= 0)
+            return Task.FromResult(new VoteResult(votes, null));
 
-        var from = account.Expiry is { } e && e > NowUtc ? e : NowUtc;
-        account.Expiry = from.AddDays(supporterDays);
-        account.Subscriber = true;
-        return Task.FromResult(new VoteResult(votes, SupporterChange.Extended, account.Expiry));
+        var from = Direct.TryGetValue(userId, out var e) && e > NowUtc ? e : NowUtc;
+        Direct[userId] = from.AddDays(directDays);
+        return Task.FromResult(new VoteResult(votes, Direct[userId]));
+    }
+
+    public Task<bool> HasDirectAsync(long userId, CancellationToken cancellationToken)
+    {
+        Calls++;
+        ThrowIfSet();
+        return Task.FromResult(Direct.TryGetValue(userId, out var end) && end > NowUtc);
     }
 
     public Task<VoteStatus> GetStatusAsync(long userId, CancellationToken cancellationToken)
@@ -68,9 +74,10 @@ internal sealed class FakeStore : IVoteStore
         Calls++;
         ThrowIfSet();
         if (!Accounts.TryGetValue(userId, out var account))
-            return Task.FromResult(new VoteStatus(0, false, null));
+            return Task.FromResult(new VoteStatus(0, false, null, null));
         var active = account.Subscriber && (account.Expiry is null || account.Expiry > NowUtc);
-        return Task.FromResult(new VoteStatus(Votes.GetValueOrDefault(userId), active, active ? account.Expiry : null));
+        DateTime? direct = Direct.TryGetValue(userId, out var end) && end > NowUtc ? end : null;
+        return Task.FromResult(new VoteStatus(Votes.GetValueOrDefault(userId), active, active ? account.Expiry : null, direct));
     }
 
     public Task<IReadOnlyList<long>> ExpireSupporterAsync(CancellationToken cancellationToken)
@@ -203,11 +210,32 @@ internal sealed class FakeCommands : ICommandRegistry
 
 internal sealed class FakeEvents : IEventBus
 {
-    public IDisposable Subscribe<TEvent>(Func<TEvent, CancellationToken, Task> handler)
-        where TEvent : IPluginEvent => throw new NotSupportedException("the votes plugin subscribes to nothing");
+    private readonly List<(Type Type, Func<object, CancellationToken, Task> Handler)> _handlers = new();
 
-    public Task PublishAsync<TEvent>(TEvent @event, CancellationToken cancellationToken = default)
-        where TEvent : IPluginEvent => Task.CompletedTask;
+    public int Subscriptions => _handlers.Count;
+
+    public IDisposable Subscribe<TEvent>(Func<TEvent, CancellationToken, Task> handler)
+        where TEvent : IPluginEvent
+    {
+        var entry = (typeof(TEvent), (Func<object, CancellationToken, Task>)((e, ct) => handler((TEvent)e, ct)));
+        _handlers.Add(entry);
+        return new Subscription(() => _handlers.Remove(entry));
+    }
+
+    public async Task PublishAsync<TEvent>(TEvent @event, CancellationToken cancellationToken = default)
+        where TEvent : IPluginEvent
+    {
+        foreach (var (type, handler) in _handlers.ToArray())
+        {
+            if (type == typeof(TEvent))
+                await handler(@event!, cancellationToken);
+        }
+    }
+
+    private sealed class Subscription(Action dispose) : IDisposable
+    {
+        public void Dispose() => dispose();
+    }
 }
 
 internal sealed class FakeMessenger : IHostMessenger
@@ -250,7 +278,9 @@ internal sealed class FakeContext : IPluginContext
 
     public IPluginLogger Logger => Log;
 
-    public IEventBus Events { get; } = new FakeEvents();
+    public FakeEvents EventBus { get; } = new();
+
+    public IEventBus Events => EventBus;
 
     public FakeCommands CommandRegistry { get; } = new();
 

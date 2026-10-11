@@ -48,60 +48,75 @@ public sealed class MySqlVoteStoreTests
     }
 
     [MySqlFact]
-    public async Task Votes_count_and_stack_supporter_without_shortening_it()
+    public async Task Votes_count_and_stack_osu_direct_and_leave_supporter_alone()
     {
         await using var db = await TestDatabases.CreateAsync();
         await db.ExecAsync(
             "INSERT INTO {osu}.phpbb_users VALUES "
             + "(1, 'new', 'new', 0, 0, NULL), "
-            + "(2, 'bought', 'bought', 0, 1, UTC_TIMESTAMP() + INTERVAL 30 DAY), "
-            + "(3, 'lapsed', 'lapsed', 0, 0, UTC_TIMESTAMP() - INTERVAL 10 DAY), "
-            + "(4, 'forever', 'forever', 0, 1, NULL)");
+            + "(2, 'bought', 'bought', 0, 1, UTC_TIMESTAMP() + INTERVAL 30 DAY)");
         var store = db.Store();
-        var before = await db.ScalarDateAsync("SELECT osu_subscriptionexpiry FROM {osu}.phpbb_users WHERE user_id = 2");
+        var bought = await db.ScalarDateAsync("SELECT osu_subscriptionexpiry FROM {osu}.phpbb_users WHERE user_id = 2");
 
         var first = await store.RecordVoteAsync(1, 1, default);
         var second = await store.RecordVoteAsync(1, 1, default);
-        var bought = await store.RecordVoteAsync(2, 2, default);
-        var lapsed = await store.RecordVoteAsync(3, 1, default);
-        var forever = await store.RecordVoteAsync(4, 1, default);
+        var supporter = await store.RecordVoteAsync(2, 2, default);
         var countOnly = await store.RecordVoteAsync(1, 0, default);
 
         var now = await db.ScalarDateAsync("SELECT UTC_TIMESTAMP()");
         Assert.Equal(1, first.Votes);
         Assert.Equal(2, second.Votes);
         Assert.Equal(3, countOnly.Votes);
-        Assert.Equal(SupporterChange.None, countOnly.Supporter);
-        Assert.Equal(SupporterChange.Extended, second.Supporter);
-        Assert.InRange((second.SupporterEndsUtc!.Value - now).TotalHours, 47.9, 48.1);
-        Assert.Equal(before.AddDays(2), bought.SupporterEndsUtc);
-        Assert.InRange((lapsed.SupporterEndsUtc!.Value - now).TotalHours, 23.9, 24.1);
-        Assert.Equal(SupporterChange.NoEndDate, forever.Supporter);
-        Assert.Null(await db.ScalarAsync("SELECT osu_subscriptionexpiry FROM {osu}.phpbb_users WHERE user_id = 4"));
-        Assert.Equal(1L, Convert.ToInt64(await db.ScalarAsync("SELECT osu_subscriber FROM {osu}.phpbb_users WHERE user_id = 3"), CultureInfo.InvariantCulture));
+        Assert.Null(countOnly.DirectEndsUtc);
+        Assert.InRange((second.DirectEndsUtc!.Value - now).TotalHours, 47.9, 48.1);
+        Assert.InRange((supporter.DirectEndsUtc!.Value - now).TotalHours, 47.9, 48.1);
+
+        // Votes don't touch supporter.
+        Assert.Equal(0L, Convert.ToInt64(await db.ScalarAsync("SELECT osu_subscriber FROM {osu}.phpbb_users WHERE user_id = 1"), CultureInfo.InvariantCulture));
+        Assert.Equal(bought, await db.ScalarDateAsync("SELECT osu_subscriptionexpiry FROM {osu}.phpbb_users WHERE user_id = 2"));
 
         // The plugin's table is in the connection's own database, not the website's.
         Assert.Equal(3L, Convert.ToInt64(await db.ScalarAsync("SELECT votes FROM {tomyum}.plugin_votes WHERE user_id = 1"), CultureInfo.InvariantCulture));
 
+        Assert.True(await store.HasDirectAsync(1, default));
+        Assert.False(await store.HasDirectAsync(404, default));
         var status = await store.GetStatusAsync(1, default);
         Assert.Equal(3, status.Votes);
-        Assert.True(status.IsSupporter);
-        Assert.Equal(new VoteStatus(1, true, null), await store.GetStatusAsync(4, default));
-        Assert.Equal(new VoteStatus(0, false, null), await store.GetStatusAsync(404, default));
+        Assert.False(status.IsSupporter);
+        Assert.NotNull(status.DirectEndsUtc);
+        Assert.True((await store.GetStatusAsync(2, default)).IsSupporter);
+        Assert.Equal(new VoteStatus(0, false, null, null), await store.GetStatusAsync(404, default));
+    }
+
+    [MySqlFact]
+    public async Task An_older_table_gets_the_osu_direct_column()
+    {
+        await using var db = await TestDatabases.CreateAsync();
+        await db.ExecAsync("INSERT INTO {osu}.phpbb_users VALUES (1, 'a', 'a', 0, 0, NULL); "
+            + "CREATE TABLE {tomyum}.plugin_votes (user_id INT UNSIGNED NOT NULL PRIMARY KEY, votes INT UNSIGNED NOT NULL DEFAULT 0, "
+            + "first_voted_at DATETIME NOT NULL, last_voted_at DATETIME NOT NULL); "
+            + "INSERT INTO {tomyum}.plugin_votes VALUES (1, 4, UTC_TIMESTAMP(), UTC_TIMESTAMP())");
+        var store = db.Store();
+
+        var result = await store.RecordVoteAsync(1, 1, default);
+
+        Assert.Equal(5, result.Votes);
+        Assert.NotNull(result.DirectEndsUtc);
     }
 
     [MySqlFact]
     public async Task Votes_at_the_same_moment_all_count()
     {
         await using var db = await TestDatabases.CreateAsync();
-        await db.ExecAsync("INSERT INTO {osu}.phpbb_users VALUES (1, 'a', 'a', 0, 1, UTC_TIMESTAMP() + INTERVAL 5 DAY)");
-        var before = await db.ScalarDateAsync("SELECT osu_subscriptionexpiry FROM {osu}.phpbb_users WHERE user_id = 1");
+        await db.ExecAsync("INSERT INTO {osu}.phpbb_users VALUES (1, 'a', 'a', 0, 0, NULL)");
         var store = db.Store();
+        await store.RecordVoteAsync(1, 1, default);
+        var before = await db.ScalarDateAsync("SELECT direct_until FROM {tomyum}.plugin_votes WHERE user_id = 1");
 
         await Task.WhenAll(Enumerable.Range(0, 10).Select(_ => Task.Run(() => store.RecordVoteAsync(1, 1, default))));
 
-        Assert.Equal(10, (await store.GetStatusAsync(1, default)).Votes);
-        Assert.Equal(before.AddDays(10), await db.ScalarDateAsync("SELECT osu_subscriptionexpiry FROM {osu}.phpbb_users WHERE user_id = 1"));
+        Assert.Equal(11, (await store.GetStatusAsync(1, default)).Votes);
+        Assert.Equal(before.AddDays(10), await db.ScalarDateAsync("SELECT direct_until FROM {tomyum}.plugin_votes WHERE user_id = 1"));
     }
 
     [MySqlFact]

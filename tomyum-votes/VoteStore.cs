@@ -2,10 +2,12 @@
 //
 // Two databases on the same MySQL server, through the trusted plugin connection (IPluginContext.Data):
 //   - TomYum's own database (Database:Name, `tomyum` in production) is the connection's default; the
-//     plugin keeps its vote counts there in `plugin_votes`, created when it's missing.
+//     plugin keeps its vote counts and each voter's osu!direct time there in `plugin_votes`, created
+//     (and given new columns) when it's missing. The website reads it too (the vote page, and its
+//     osu!direct button for voters).
 //   - The website's database (`osu`, config osuWebDatabase) holds the accounts. osu!supporter is
-//     phpbb_users.osu_subscriber + osu_subscriptionexpiry, the same two columns the website's store
-//     sets when a supporter tag is bought, and that TomYum reads for the in-game supporter privilege.
+//     phpbb_users.osu_subscriber + osu_subscriptionexpiry, set by the website's store; votes don't touch
+//     it any more (they give osu!direct only), but the plugin still ends supporter whose time is up.
 
 using System;
 using System.Collections.Generic;
@@ -23,30 +25,17 @@ namespace TomYum.Plugins.Votes;
 /// <param name="Username">The player's current name.</param>
 public sealed record VoteUser(long UserId, string Username);
 
-/// <summary>What a vote did to the player's osu!supporter.</summary>
-public enum SupporterChange
-{
-    /// <summary>Nothing: votes don't give supporter (daysPerVote is 0).</summary>
-    None,
-
-    /// <summary>Days were added on top of whatever supporter time was left.</summary>
-    Extended,
-
-    /// <summary>The player's supporter has no end date, so there was nothing to add.</summary>
-    NoEndDate,
-}
-
 /// <summary>The outcome of one counted vote.</summary>
 /// <param name="Votes">The player's votes, this one included.</param>
-/// <param name="Supporter">What happened to their supporter.</param>
-/// <param name="SupporterEndsUtc">When their supporter ends now (UTC), or null when it has no end date or wasn't touched.</param>
-public sealed record VoteResult(int Votes, SupporterChange Supporter, DateTime? SupporterEndsUtc);
+/// <param name="DirectEndsUtc">When their osu!direct ends now (UTC), or null when votes don't give any (daysPerVote 0).</param>
+public sealed record VoteResult(int Votes, DateTime? DirectEndsUtc);
 
-/// <summary>A player's votes and supporter, for <c>!vote</c>.</summary>
+/// <summary>A player's votes, osu!direct and supporter, for <c>!vote</c>.</summary>
 /// <param name="Votes">Votes counted so far.</param>
 /// <param name="IsSupporter">Whether they have osu!supporter right now.</param>
 /// <param name="SupporterEndsUtc">When it ends (UTC), or null when it has no end date or they have none.</param>
-public sealed record VoteStatus(int Votes, bool IsSupporter, DateTime? SupporterEndsUtc);
+/// <param name="DirectEndsUtc">When their voted osu!direct ends (UTC), or null when they have none left.</param>
+public sealed record VoteStatus(int Votes, bool IsSupporter, DateTime? SupporterEndsUtc, DateTime? DirectEndsUtc);
 
 /// <summary>Where votes and supporter are read and written.</summary>
 public interface IVoteStore
@@ -57,12 +46,18 @@ public interface IVoteStore
     /// <returns>The account, or null when there's none (deleted accounts included).</returns>
     Task<VoteUser?> FindUserAsync(string username, CancellationToken cancellationToken);
 
-    /// <summary>Counts a vote and adds <paramref name="supporterDays"/> days of supporter, in one transaction.</summary>
+    /// <summary>Counts a vote and adds <paramref name="directDays"/> days of osu!direct, in one transaction.</summary>
     /// <param name="userId">The voter.</param>
-    /// <param name="supporterDays">Days of supporter per vote; 0 counts the vote only.</param>
+    /// <param name="directDays">Days of osu!direct per vote; 0 counts the vote only.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
-    /// <returns>The new count and what happened to their supporter.</returns>
-    Task<VoteResult> RecordVoteAsync(long userId, int supporterDays, CancellationToken cancellationToken);
+    /// <returns>The new count and when their osu!direct ends.</returns>
+    Task<VoteResult> RecordVoteAsync(long userId, int directDays, CancellationToken cancellationToken);
+
+    /// <summary>Whether the player has voted osu!direct time left.</summary>
+    /// <param name="userId">The player.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>True while their osu!direct lasts.</returns>
+    Task<bool> HasDirectAsync(long userId, CancellationToken cancellationToken);
 
     /// <summary>A player's votes and supporter.</summary>
     /// <param name="userId">The player.</param>
@@ -70,7 +65,7 @@ public interface IVoteStore
     /// <returns>Their status; 0 votes and no supporter for an unknown id.</returns>
     Task<VoteStatus> GetStatusAsync(long userId, CancellationToken cancellationToken);
 
-    /// <summary>Takes supporter off everyone whose supporter end date has passed (bought or voted).</summary>
+    /// <summary>Takes supporter off everyone whose supporter end date has passed (nothing else in the stack does).</summary>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>The user ids whose supporter ended in this pass.</returns>
     Task<IReadOnlyList<long>> ExpireSupporterAsync(CancellationToken cancellationToken);
@@ -91,6 +86,7 @@ public sealed class MySqlVoteStore : IVoteStore
         + " `votes` INT UNSIGNED NOT NULL DEFAULT 0,"
         + " `first_voted_at` DATETIME NOT NULL,"
         + " `last_voted_at` DATETIME NOT NULL,"
+        + " `direct_until` DATETIME NULL,"
         + " PRIMARY KEY (`user_id`)"
         + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
 
@@ -144,7 +140,7 @@ public sealed class MySqlVoteStore : IVoteStore
     }
 
     /// <inheritdoc/>
-    public async Task<VoteResult> RecordVoteAsync(long userId, int supporterDays, CancellationToken cancellationToken)
+    public async Task<VoteResult> RecordVoteAsync(long userId, int directDays, CancellationToken cancellationToken)
     {
         var connection = await _data.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using (connection.ConfigureAwait(false))
@@ -155,54 +151,57 @@ public sealed class MySqlVoteStore : IVoteStore
             var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
             await using (transaction.ConfigureAwait(false))
             {
-                // Lock the account row so a store purchase or a second vote at the same moment waits for us.
-                var (found, subscriber, expiry) = await ReadSupporterAsync(connection, transaction, userId, forUpdate: true, cancellationToken)
+                var exists = await ScalarAsync(connection, transaction, $"SELECT 1 FROM {_users} WHERE user_id = @id", cancellationToken, ("@id", userId))
                     .ConfigureAwait(false);
-                if (!found)
+                if (exists is null)
                     throw new InvalidOperationException($"user {userId} doesn't exist");
 
+                // The days go on top of the osu!direct time left, or start from now when it has run out.
                 await ExecuteAsync(
                     connection,
                     transaction,
-                    $"INSERT INTO `{VotesTable}` (user_id, votes, first_voted_at, last_voted_at) VALUES (@id, 1, UTC_TIMESTAMP(), UTC_TIMESTAMP()) "
-                    + "ON DUPLICATE KEY UPDATE votes = votes + 1, last_voted_at = UTC_TIMESTAMP()",
+                    $"INSERT INTO `{VotesTable}` (user_id, votes, first_voted_at, last_voted_at, direct_until) "
+                    + "VALUES (@id, 1, UTC_TIMESTAMP(), UTC_TIMESTAMP(), IF(@days > 0, DATE_ADD(UTC_TIMESTAMP(), INTERVAL @days DAY), NULL)) "
+                    + "ON DUPLICATE KEY UPDATE votes = votes + 1, last_voted_at = UTC_TIMESTAMP(), direct_until = IF(@days > 0, "
+                    + "DATE_ADD(GREATEST(COALESCE(direct_until, UTC_TIMESTAMP()), UTC_TIMESTAMP()), INTERVAL @days DAY), direct_until)",
                     cancellationToken,
-                    ("@id", userId)).ConfigureAwait(false);
-                var votes = ToInt32(await ScalarAsync(
-                    connection, transaction, $"SELECT votes FROM `{VotesTable}` WHERE user_id = @id", cancellationToken, ("@id", userId))
-                    .ConfigureAwait(false));
+                    ("@id", userId),
+                    ("@days", directDays)).ConfigureAwait(false);
 
-                VoteResult result;
-                if (supporterDays <= 0)
+                int votes;
+                DateTime? directEnds;
+                var command = Command(connection, transaction, $"SELECT votes, direct_until FROM `{VotesTable}` WHERE user_id = @id", ("@id", userId));
+                await using (command.ConfigureAwait(false))
                 {
-                    result = new VoteResult(votes, SupporterChange.None, null);
-                }
-                else if (subscriber && expiry is null)
-                {
-                    // Supporter with no end date (given by hand): adding days would give it one.
-                    result = new VoteResult(votes, SupporterChange.NoEndDate, null);
-                }
-                else
-                {
-                    // Like the store's ApplySupporterTag: the days go on top of the time left, or start
-                    // from now when it has run out. The end date only ever moves later.
-                    await ExecuteAsync(
-                        connection,
-                        transaction,
-                        $"UPDATE {_users} SET osu_subscriber = 1, osu_subscriptionexpiry = "
-                        + "DATE_ADD(GREATEST(COALESCE(osu_subscriptionexpiry, UTC_TIMESTAMP()), UTC_TIMESTAMP()), INTERVAL @days DAY) "
-                        + "WHERE user_id = @id",
-                        cancellationToken,
-                        ("@days", supporterDays),
-                        ("@id", userId)).ConfigureAwait(false);
-                    var (_, _, newExpiry) = await ReadSupporterAsync(connection, transaction, userId, forUpdate: false, cancellationToken)
-                        .ConfigureAwait(false);
-                    result = new VoteResult(votes, SupporterChange.Extended, newExpiry);
+                    var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                    await using (reader.ConfigureAwait(false))
+                    {
+                        await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+                        votes = ToInt32(reader.GetValue(0));
+                        directEnds = ToDateTime(reader.GetValue(1));
+                    }
                 }
 
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-                return result;
+                return new VoteResult(votes, directDays > 0 ? directEnds : null);
             }
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task<bool> HasDirectAsync(long userId, CancellationToken cancellationToken)
+    {
+        var connection = await _data.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using (connection.ConfigureAwait(false))
+        {
+            await EnsureSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
+            var found = await ScalarAsync(
+                connection,
+                null,
+                $"SELECT 1 FROM `{VotesTable}` WHERE user_id = @id AND direct_until > UTC_TIMESTAMP()",
+                cancellationToken,
+                ("@id", userId)).ConfigureAwait(false);
+            return found is not null;
         }
     }
 
@@ -217,7 +216,7 @@ public sealed class MySqlVoteStore : IVoteStore
             var command = Command(
                 connection,
                 null,
-                $"SELECT u.osu_subscriber, u.osu_subscriptionexpiry, UTC_TIMESTAMP(), COALESCE(v.votes, 0) FROM {_users} u "
+                $"SELECT u.osu_subscriber, u.osu_subscriptionexpiry, UTC_TIMESTAMP(), COALESCE(v.votes, 0), v.direct_until FROM {_users} u "
                 + $"LEFT JOIN `{VotesTable}` v ON v.user_id = u.user_id WHERE u.user_id = @id",
                 ("@id", userId));
             await using (command.ConfigureAwait(false))
@@ -226,14 +225,15 @@ public sealed class MySqlVoteStore : IVoteStore
                 await using (reader.ConfigureAwait(false))
                 {
                     if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                        return new VoteStatus(0, false, null);
+                        return new VoteStatus(0, false, null, null);
 
                     var subscriber = Convert.ToBoolean(reader.GetValue(0), CultureInfo.InvariantCulture);
                     var expiry = ToDateTime(reader.GetValue(1));
                     var now = ToDateTime(reader.GetValue(2)) ?? DateTime.UtcNow;
                     var votes = ToInt32(reader.GetValue(3));
                     var active = subscriber && (expiry is null || expiry > now);
-                    return new VoteStatus(votes, active, active ? expiry : null);
+                    var direct = ToDateTime(reader.GetValue(4));
+                    return new VoteStatus(votes, active, active ? expiry : null, direct > now ? direct : null);
                 }
             }
         }
@@ -283,27 +283,18 @@ public sealed class MySqlVoteStore : IVoteStore
             return;
 
         await ExecuteAsync(connection, null, CreateTableSql, cancellationToken).ConfigureAwait(false);
-        _schemaReady = true;
-    }
 
-    private async Task<(bool Found, bool Subscriber, DateTime? Expiry)> ReadSupporterAsync(
-        DbConnection connection, DbTransaction? transaction, long userId, bool forUpdate, CancellationToken cancellationToken)
-    {
-        var command = Command(
+        // Tables made before votes gave osu!direct don't have its column yet.
+        var hasDirect = await ScalarAsync(
             connection,
-            transaction,
-            $"SELECT osu_subscriber, osu_subscriptionexpiry FROM {_users} WHERE user_id = @id" + (forUpdate ? " FOR UPDATE" : string.Empty),
-            ("@id", userId));
-        await using (command.ConfigureAwait(false))
-        {
-            var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            await using (reader.ConfigureAwait(false))
-            {
-                if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                    return (false, false, null);
-                return (true, Convert.ToBoolean(reader.GetValue(0), CultureInfo.InvariantCulture), ToDateTime(reader.GetValue(1)));
-            }
-        }
+            null,
+            "SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @table AND COLUMN_NAME = 'direct_until'",
+            cancellationToken,
+            ("@table", VotesTable)).ConfigureAwait(false);
+        if (hasDirect is null)
+            await ExecuteAsync(connection, null, $"ALTER TABLE `{VotesTable}` ADD COLUMN `direct_until` DATETIME NULL", cancellationToken).ConfigureAwait(false);
+
+        _schemaReady = true;
     }
 
     private static DbCommand Command(DbConnection connection, DbTransaction? transaction, string sql, params (string Name, object Value)[] parameters)
