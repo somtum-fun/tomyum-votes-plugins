@@ -2,7 +2,7 @@
 
 A loose-source TomYum plugin. When someone votes for the server on
 [osu-server-list.com](https://osu-server-list.com/server/somtum/vote) (OSL), OSL calls the server and the
-player gets their vote counted plus osu!supporter days. It works like bancho.py's `/vote-callback`.
+player gets their vote counted plus days of osu!direct. It works like bancho.py's `/vote-callback`.
 
 ## What it does
 
@@ -12,30 +12,30 @@ player gets their vote counted plus osu!supporter days. It works like bancho.py'
     osu-web matches them: any case, and spaces and underscores are treated as the same.
   - `200` with an empty body when the vote is counted.
   - `503` when the plugin has no database access, and `500` when the database fails (the error is logged).
-- **Reward:** each vote adds `daysPerVote` days of osu!supporter. These are the same two columns the website's store
-  sets when someone buys a supporter tag (`phpbb_users.osu_subscriber` and `osu_subscriptionexpiry`). The days go on
-  top of any time the player still has, or start from now if their supporter has run out. The end date only
-  ever moves later. A player whose supporter has no end date (given by hand) keeps it as it is. Votes aren't
-  donations, so `osu_user_donations` and the supporter level aren't touched.
-- **BanchoBot thanks the voter** if they're online in osu!stable: "Thank you for voting for osu!somtum! ...", then
-  how many days they got and the new end date.
-- **`!vote`** shows the player's vote count, when their supporter ends, and the voting link.
-- **Supporter that has run out is taken off.** Nothing else in this stack does this: osu-web's store only sets the
-  end date, and TomYum only reads `osu_subscriber`. Every `expireIntervalMinutes`, the plugin sets
-  `osu_subscriber = 0` for everyone whose end date has passed, whether the time was bought or voted. It keeps the
-  end date, so the website still shows that they've supported. Players who are online get a notification.
-  Supporter with no end date is never touched.
-
-TomYum reads a player's supporter status when they log in, so in osu!stable a new or ended supporter takes effect
-on their next login. The website shows it straight away.
+- **Reward: osu!direct, not supporter.** Each vote adds `daysPerVote` days of osu!direct (`direct_until` in the
+  plugin's table), on top of any time the player still has, or from now if it has run out. Nothing else of
+  supporter's comes with it (unlimited name changes, profile perks, upload quota...); supporter stays what the
+  website's store sells, and votes don't touch it.
+  - **In game:** at an osu!stable login TomYum raises `ClientPerksEvent`; the plugin sets `OsuDirect` for a voter
+    with time left, and TomYum sends that session the client's supporter bit (the client only shows osu!direct
+    with it). New time takes effect on the player's next login.
+  - **On the website:** osu-web reads `direct_until` too (`TomYumVotes`) and shows its osu!direct button.
+- **BanchoBot thanks the voter** if they're online in osu!stable: "Thank you for voting for somtum.fun! ...", then
+  how many days of osu!direct they got and the new end date.
+- **`!vote`** shows the player's vote count, when their osu!direct (or supporter) ends, and the voting link.
+- **Bought supporter that has run out is taken off.** Nothing else in this stack does this: osu-web's store only
+  sets the end date, and TomYum only reads `osu_subscriber`. Every `expireIntervalMinutes`, the plugin sets
+  `osu_subscriber = 0` for everyone whose end date has passed. It keeps the end date, so the website still shows
+  that they've supported. Players who are online get a notification. Supporter with no end date is never touched.
+  (Before 1.1.0 votes gave supporter time; that time runs out the same way.)
 
 ### Where the data is
 
 - **Vote counts** go in the `plugin_votes` table in **TomYum's own database** (`Database:Name`, which is
   `tomyum` in production). That's the default database of the plugin's trusted connection. The table is created
   the first time it's needed:
-  `user_id` (primary key), `votes`, `first_voted_at`, `last_voted_at` (UTC).
-- **Supporter** is in the website's database (`osu`, see `osuWebDatabase`), in `phpbb_users`.
+  `user_id` (primary key), `votes`, `first_voted_at`, `last_voted_at`, `direct_until` (UTC; added to older tables).
+- **Supporter** is in the website's database (`osu`, see `osuWebDatabase`), in `phpbb_users` (only read, and ended).
 
 ## Config (`Plugins:tomyum.votes`)
 
@@ -43,7 +43,7 @@ on their next login. The website shows it straight away.
 |---|---|---|
 | `apiKey` | *(empty)* | OSL's API key (bancho.py's `OSU_SERVER_LIST_API_KEY`). **Required.** While it's empty, every callback gets 401. |
 | `voteUrl` | `https://osu-server-list.com/server/somtum/vote` | The link `!vote` shows. |
-| `daysPerVote` | `1` | Days of supporter per vote. `0` counts votes without giving supporter. |
+| `daysPerVote` | `1` | Days of osu!direct per vote. `0` counts votes without giving anything. |
 | `subdomains` | `osu,c` | The host names (first label) the callback answers on. `*` means every host TomYum serves. |
 | `osuWebDatabase` | `osu` | The website's database name. |
 | `expireSupporter` | `true` | Take ended supporter off. Leave it on unless something else does this. |
